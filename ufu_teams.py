@@ -7,7 +7,7 @@ BASE_SP = "https://ufubr.sharepoint.com"
 pasta_base = Path(__file__).parent / "UFU_Teams"
 arquivo_ctrl = pasta_base / ".baixados.json"
 EXTENSOES = {".pdf", ".pptx", ".ppt", ".docx", ".doc", ".xlsx", ".zip", ".txt"}
-intervalo_watch = 300  # segundos entre verificações
+intervalo_watch = 60  # segundos entre verificações
 margem_renovar = 10  # renova token X minutos antes de expirar
 debug = False
 
@@ -285,7 +285,7 @@ def hdrs(token):
     }
 
 
-def get(url, token, *, timeout=15, stream=False):
+def get(url, token, *, timeout=20, stream=False):
     global _flag_401
     r = requests.get(url, headers=hdrs(token), timeout=timeout, stream=stream)
     if r.status_code == 401:
@@ -338,7 +338,7 @@ def _tem_biblioteca_aula(token, slug):
         f"?$filter=BaseTemplate eq 101 and Hidden eq false&$select=Title"
     )
     try:
-        r = get(url, token, timeout=8)
+        r = get(url, token, timeout=16)
         listas = r.json().get("value", []) if r.status_code == 200 else []
         if isinstance(listas, dict):
             listas = listas.get("results", [])
@@ -386,7 +386,7 @@ def listar_turmas(token):
         vistos_já = {s["slug"] for s in encontrados}
         for slug in minhas_turmas:
             if slug not in vistos_já:
-                r = get(f"{BASE_SP}/sites/{slug}/_api/web/title", token, timeout=8)
+                r = get(f"{BASE_SP}/sites/{slug}/_api/web/title", token, timeout=16)
                 if r.status_code == 200:
                     adicionar(r.json().get("value", slug), slug)
 
@@ -510,12 +510,20 @@ def listar_arquivos_turma(token, slug):
     return todos
 
 
+def _calcular_hash(caminho: Path) -> str:
+    h = hashlib.md5()
+    with open(caminho, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def baixar_arquivo(token, arquivo, pasta_destino, numero=0):
     pasta_destino.mkdir(parents=True, exist_ok=True)
     nome_salvo = f"{numero:03d}_{arquivo['nome']}" if numero > 0 else arquivo["nome"]
     caminho = pasta_destino / nome_salvo
     if caminho.exists():
-        return None
+        return None, None
 
     print(f"    baixando: {nome_salvo} ", end="", flush=True)
 
@@ -538,14 +546,15 @@ def baixar_arquivo(token, arquivo, pasta_destino, numero=0):
                 print("token expirado")
                 if caminho.exists():
                     caminho.unlink()
-                return None
+                return None, None
             if r.status_code == 200:
                 with open(caminho, "wb") as f:
                     total = sum(
                         len(chunk) for chunk in r.iter_content(8192) if f.write(chunk)
                     )
+                arquivo_hash = _calcular_hash(caminho)
                 print(f"ok ({total/1024:.1f} KB)")
-                return caminho
+                return caminho, arquivo_hash
         except Exception as e:
             if debug:
                 print(f"\n {e}", end="")
@@ -553,7 +562,7 @@ def baixar_arquivo(token, arquivo, pasta_destino, numero=0):
     print("erro")
     if caminho.exists():
         caminho.unlink()
-    return None
+    return None, None
 
 
 # notificaçãotg
@@ -784,8 +793,9 @@ def executar_ciclo(token, ctrl):
         arquivos.sort(key=lambda a: a["modificado"])
         print(f"    {len(arquivos)} arquivo(s) encontrado(s)")
 
-        ja_baixados = sum(1 for v in ctrl.values() if v.get("turma") == slug)
-        proximo = ja_baixados + 1
+        numeros_usados = [v.get("numero", 0) for v in ctrl.values() if v.get("turma") == slug]
+        proximo = (max(numeros_usados) + 1) if numeros_usados else 1
+        hashes_baixados = {v["hash"] for v in ctrl.values() if v.get("turma") == slug and v.get("hash")}
         novos = 0
 
         fila_notif = []
@@ -795,17 +805,31 @@ def executar_ciclo(token, ctrl):
             uid = arq["id_unico"]
             if uid in ctrl:
                 continue
-            if baixar_arquivo(token, arq, pasta_base / slug, numero=proximo):
+            caminho_baixado, arquivo_hash = baixar_arquivo(token, arq, pasta_base / slug, numero=proximo)
+            if caminho_baixado:
+                if arquivo_hash and arquivo_hash in hashes_baixados:
+                    print(f"    duplicata detectada (hash igual), removendo: {caminho_baixado.name}")
+                    caminho_baixado.unlink()
+                    ctrl[uid] = {
+                        "nome": arq["nome"],
+                        "turma": slug,
+                        "numero": -1,
+                        "hash": arquivo_hash,
+                        "duplicata": True,
+                        "baixado_em": datetime.now().isoformat(),
+                    }
+                    salvar_controle(ctrl)
+                    continue
                 ctrl[uid] = {
                     "nome": arq["nome"],
                     "turma": slug,
                     "numero": proximo,
+                    "hash": arquivo_hash,
                     "baixado_em": datetime.now().isoformat(),
                 }
+                if arquivo_hash:
+                    hashes_baixados.add(arquivo_hash)
                 salvar_controle(ctrl)
-                caminho_baixado = (
-                    pasta_base / slug / f"{ctrl[uid]['numero']:03d}_{arq['nome']}"
-                )
                 fila_notif.append((nome, caminho_baixado))
                 proximo += 1
                 novos += 1
@@ -837,8 +861,8 @@ def main():
 
     token = obter_token_valido(perfil_dir, arquivo_token, headless)
     if not token:
-        print("[ERRO] não foi possível obter um token válido.")
-        print("  delete a pasta do perfil e rode novamente para refazer o login.")
+        print("não foi possível obter um token válido.")
+        print("delete a pasta do perfil e rode novamente para refazer o login.")
         sys.exit(1)
 
     if not verificar_token(token):
@@ -937,7 +961,7 @@ def main():
 
             if _flag_401:
                 print(
-                    "  [aviso] não foi possível obter um token aceito pela API "
+                    "não foi possível obter um token aceito pela API "
                     "após múltiplas tentativas neste ciclo."
                 )
 
