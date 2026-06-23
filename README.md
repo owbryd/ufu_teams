@@ -1,6 +1,6 @@
-# UFU Teams Monitor
+# UFU Monitor
 
-Script que monitora automaticamente os materiais de aula postados no Microsoft Teams da UFU, salva os novos materiais no computador e envia uma notificação com o arquivo no Telegram e/ou WhatsApp.
+Script que monitora automaticamente os materiais de aula postados no Microsoft Teams e Moodle da UFU, salva os novos materiais no computador e envia uma notificação com o arquivo no Telegram e/ou WhatsApp.
 
 ## Demonstração
 
@@ -17,6 +17,7 @@ A partir daí o script roda em loop, verificando a cada x segundos se há arquiv
 
 A autenticação com o sharepoint é feita via jwt e o script intercepta o token nas requisições do browser, monitora o tempo de expiração e renova antes de vencer.
 
+O script Moodle usa a api do aplicativo e faz login com usuário e senha para obter um wstoken, que é salvo em cache e reutilizado nas próximas execuções. Com o token, ele consulta as disciplinas matriculadas, percorre as seções de cada disciplina e coleta os arquivos dos módulos.
 ## Requisitos
 
 - Python 3.10+
@@ -30,7 +31,7 @@ playwright install chromium
 
 ## Configuração
 
-Edite as variáveis no topo do arquivo `ufu_teams.py`:
+Edite as variáveis no topo dos arquivos `ufu_teams.py` e `ufu_moodle.py`:
 
 ```python
 intervalo_watch = 300       # intervalo entre verificações em segundos
@@ -41,17 +42,23 @@ pasta_base      = ...      # onde os arquivos serão salvos (padrão: ./UFU_Team
 telegram_ativo   = True                  # False para desativar notificações
 whatsapp_ativo   = True                  # False para desativar notificações pelo WhatsApp
 
-minhas_turmas = []  # deixe vazio para detectar automaticamente                   
+minhas_turmas = []  # deixe vazio para detectar automaticamente
+
+moodle_usuario = os.environ.get("MOODLE_USUARIO", "")  #user do moodle
+moodle_senha   = os.environ.get("MOODLE_SENHA",   "")  #senha do moodle                  
+
+
 ```
 
 
 ## Uso
 
 ```bash
-python ufu_teams.py --watch
+python ufu_teams.py
+python ufu_moodle.py
 ```
 
-No primeiro uso, um browser abre para login. Após o login, o perfil é salvo em `./ufu_perfil` e o script começa a monitorar automaticamente.
+No primeiro uso do monitor Teams, um browser abre para login. Após o login, o perfil é salvo em `./ufu_perfil` e o script começa a monitorar automaticamente.
 
 
 ## Notificações via WhatsApp
@@ -90,10 +97,10 @@ Será retornada uma lista com o nome e o ID de cada grupo. Copie o ID do grupo d
 
 ### 5. Configurar o número/grupo no Python
 
-Defina a variável de ambiente `WHATSAPP_NUMERO` com o ID do grupo:
+Defina a variável de ambiente `WHATSAPP_NUMERO` com o ID do grupo ou número:
 
 ```python
-# Em ufu_teams.py
+# Em ufu_teams.py e ufu_moodle
 whatsapp_numero = os.environ.get("WHATSAPP_NUMERO", "")
 # Exemplo: "120363xxxxxxxxxx@g.us"
 ```
@@ -109,7 +116,7 @@ whatsapp_numero = os.environ.get("WHATSAPP_NUMERO", "")
 Defina as variáveis de ambiente `TELEGRAM_TOKEN` e `TELEGRAM_CHAT_ID`:
 
 ```python
-# Em ufu_teams.py
+# Em ufu_teams.py e ufu_moodle.py
 telegram_token   = os.environ.get("TELEGRAM_TOKEN", "")
 telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
 ```
@@ -127,6 +134,13 @@ UFU_Teams/
 │   └── 003_aula2.pptx
 ├── OutraTurma-grupoufubr/
 │   └── 001_material.pdf
+└── .baixados.json       ← controle de arquivos já baixados
+
+UFU_Moodle/
+├── 13572/               ← id da disciplina
+│   ├── 001_Aula 00 - Apresentação da disciplina.pdf
+│   ├── 002_Aula 01 - Representação de dados.pdf
+│   └── 003_Lista de Exercícios 1.pdf
 └── .baixados.json       ← controle de arquivos já baixados
 ```
 
