@@ -1,13 +1,24 @@
-import os, re, sys, json, time, base64, hashlib, urllib.parse, atexit, signal
-from pathlib import Path
+import atexit
+import base64
+import hashlib
+import json
+import os
+import re
+import signal
+import sys
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
+
 import requests
 
 BASE_SP = "https://ufubr.sharepoint.com"
 pasta_base = Path(__file__).parent / "UFU_Teams"
 arquivo_ctrl = pasta_base / ".baixados.json"
 EXTENSOES = {".pdf", ".pptx", ".ppt", ".docx", ".doc", ".xlsx", ".zip", ".txt"}
-intervalo_watch = 60  # segundos entre verificações
+intervalo_watch = 20  # segundos entre verificações
 margem_renovar = 10  # renova token X minutos antes de expirar
 debug = False
 
@@ -36,9 +47,7 @@ minhas_turmas: list[str] = []
 
 # tg
 telegram_ativo = True
-telegram_token = os.environ.get(
-    "TELEGRAM_TOKEN", ""
-)
+telegram_token = os.environ.get("TELEGRAM_TOKEN", "")
 telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
 telegram_tamanho_max = 49 * 1024 * 1024  # 49 MB — limite de envio
 
@@ -112,7 +121,7 @@ def _erro_playwright():
 
 def fazer_login(perfil_dir: Path = perfil_dir_padrao) -> bool:
     try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+        from playwright.sync_api import sync_playwright
     except ImportError:
         _erro_playwright()
 
@@ -164,22 +173,7 @@ def fazer_login(perfil_dir: Path = perfil_dir_padrao) -> bool:
     return True
 
 
-def capturar_token(
-    perfil_dir: Path = perfil_dir_padrao, headless: bool = True
-) -> str | None:
-    # pegar jwt do perfil salvo
-    try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    except ImportError:
-        _erro_playwright()
-
-    if not perfil_dir.exists():
-        print(f"perfil não encontrado em '{perfil_dir}'.")
-        print("       delete a pasta do perfil e rode novamente para refazer o login.")
-        return None
-
-    token_ref = [None]
-
+def _fazer_interceptador(token_ref: list):
     def interceptar(request):
         if token_ref[0]:
             return
@@ -192,7 +186,61 @@ def capturar_token(
                 print("token capturado")
                 break
 
+    return interceptar
+
+
+def _aguardar_token(page, token_ref: list, segundos: int) -> bool:
+    for _ in range(segundos):
+        page.wait_for_timeout(1_000)
+        if token_ref[0]:
+            return True
+    return False
+
+
+def _sessao_expirou(page) -> bool:
+    return any(
+        d in page.url for d in ("login.microsoftonline.com", "login.microsoft.com")
+    )
+
+
+def _navegar_e_aguardar(
+    page, url: str, token_ref: list, espera: int, PWTimeout
+) -> bool:
+    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=20_000)
+    except PWTimeout:
+        pass
+    return _aguardar_token(page, token_ref, espera)
+
+
+def _varrer_urls_para_token(page, token_ref: list, PWTimeout) -> None:
+    if _aguardar_token(page, token_ref, 15):
+        return
+    if _navegar_e_aguardar(page, _URL_SPAPPBAR, token_ref, 10, PWTimeout):
+        return
+    if _navegar_e_aguardar(page, _URL_SP_MAIN, token_ref, 10, PWTimeout):
+        return
+    _navegar_e_aguardar(page, _URL_ONEDRIVE, token_ref, 10, PWTimeout)
+
+
+def capturar_token(
+    perfil_dir: Path = perfil_dir_padrao, headless: bool = True
+) -> str | None:
+    try:
+        from playwright.sync_api import TimeoutError as PWTimeout
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        _erro_playwright()
+
+    if not perfil_dir.exists():
+        print(f"perfil não encontrado em '{perfil_dir}'.")
+        print("       delete a pasta do perfil e rode novamente para refazer o login.")
+        return None
+
+    token_ref = [None]
     print("capturando token...")
+
     with sync_playwright() as pw:
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(perfil_dir),
@@ -200,50 +248,17 @@ def capturar_token(
             user_agent=_USER_AGENT,
         )
         page = ctx.new_page()
-        page.on("request", interceptar)
-
-        def _aguardar(s):
-            for _ in range(s):
-                page.wait_for_timeout(1_000)
-                if token_ref[0]:
-                    return True
-            return False
+        page.on("request", _fazer_interceptador(token_ref))
 
         try:
             page.goto(_URL_ONEDRIVE, wait_until="domcontentloaded", timeout=30_000)
-
-            if any(
-                d in page.url
-                for d in ("login.microsoftonline.com", "login.microsoft.com")
-            ):
+            if _sessao_expirou(page):
                 print("sessão do browser expirou")
                 ctx.close()
                 return None
-
-            if _aguardar(15):
-                return token_ref[0]
-
-            page.goto(_URL_SPAPPBAR, wait_until="domcontentloaded", timeout=30_000)
-            if _aguardar(10):
-                return token_ref[0]
-
-            page.goto(_URL_SP_MAIN, wait_until="domcontentloaded", timeout=30_000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=20_000)
-            except PWTimeout:
-                pass
-            if _aguardar(10):
-                return token_ref[0]
-
-            page.goto(_URL_ONEDRIVE, wait_until="domcontentloaded", timeout=30_000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=20_000)
-            except PWTimeout:
-                pass
-            _aguardar(10)
-
+            _varrer_urls_para_token(page, token_ref, PWTimeout)
         except PWTimeout:
-            print("[timeout")
+            print("[timeout]")
         except Exception as e:
             print(f"captura: {e}")
         finally:
@@ -347,20 +362,12 @@ def _tem_biblioteca_aula(token, slug):
         return False
 
 
-def listar_turmas(token):
-    print("buscando turmas...")
-    encontrados, vistos = [], set()
+def _e_turma(slug: str) -> bool:
+    return "grupoufubr" in slug.lower() or "grupoufu" in slug.lower()
 
-    def adicionar(nome, slug):
-        if slug and slug not in vistos:
-            vistos.add(slug)
-            encontrados.append(
-                {"nome": nome, "url": f"{BASE_SP}/sites/{slug}", "slug": slug}
-            )
 
-    def e_turma(slug):
-        return "grupoufubr" in slug.lower() or "grupoufu" in slug.lower()
-
+def _buscar_candidatos(token) -> dict:
+    candidatos = {}
     try:
         url = (
             f"{BASE_SP}/_api/search/query"
@@ -372,28 +379,76 @@ def listar_turmas(token):
             for row in sp_rows(r.json()):
                 cells = sp_cells(row)
                 slug = extrair_slug(cells.get("Path", ""))
-                if slug and e_turma(slug) and _tem_biblioteca_aula(token, slug):
-                    adicionar(cells.get("Title", slug), slug)
-                    if debug:
-                        print(f"  [ok] SP search: {slug}")
+                if slug and _e_turma(slug):
+                    candidatos[slug] = cells.get("Title", slug)
     except Exception as e:
         if debug:
             print(f"  [aviso] Search sites: {e}")
+    return candidatos
 
-    # manual
+
+def _filtrar_com_biblioteca(token, candidatos: dict, vistos: set) -> list:
+    encontrados = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futuros = {
+            pool.submit(_tem_biblioteca_aula, token, slug): (slug, nome)
+            for slug, nome in candidatos.items()
+        }
+        for fut in as_completed(futuros):
+            slug, nome = futuros[fut]
+            try:
+                tem = fut.result()
+            except Exception:
+                tem = False
+            if tem and slug not in vistos:
+                vistos.add(slug)
+                encontrados.append(
+                    {"nome": nome, "url": f"{BASE_SP}/sites/{slug}", "slug": slug}
+                )
+                if debug:
+                    print(f"  [ok] SP search: {slug}")
+    return encontrados
+
+
+def _buscar_titulo_turma(token, slug: str):
+    r = get(f"{BASE_SP}/sites/{slug}/_api/web/title", token, timeout=16)
+    if r.status_code == 200:
+        return slug, r.json().get("value", slug)
+    return slug, None
+
+
+def _complementar_minhas_turmas(token, encontrados: list, vistos: set) -> list:
+    encontrados = [s for s in encontrados if s["slug"] in minhas_turmas]
+    vistos_já = {s["slug"] for s in encontrados}
+    pendentes = [slug for slug in minhas_turmas if slug not in vistos_já]
+
+    if pendentes:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for slug, nome in pool.map(
+                lambda s: _buscar_titulo_turma(token, s), pendentes
+            ):
+                if nome and slug not in vistos:
+                    vistos.add(slug)
+                    encontrados.append(
+                        {"nome": nome, "url": f"{BASE_SP}/sites/{slug}", "slug": slug}
+                    )
+    return encontrados
+
+
+def listar_turmas(token):
+    print("buscando turmas...")
+    vistos: set = set()
+
+    candidatos = _buscar_candidatos(token)
+    encontrados = (
+        _filtrar_com_biblioteca(token, candidatos, vistos) if candidatos else []
+    )
+
     if minhas_turmas:
-        encontrados = [s for s in encontrados if s["slug"] in minhas_turmas]
-        vistos_já = {s["slug"] for s in encontrados}
-        for slug in minhas_turmas:
-            if slug not in vistos_já:
-                r = get(f"{BASE_SP}/sites/{slug}/_api/web/title", token, timeout=16)
-                if r.status_code == 200:
-                    adicionar(r.json().get("value", slug), slug)
+        encontrados = _complementar_minhas_turmas(token, encontrados, vistos)
 
     if not encontrados:
-        print(
-            "nenhuma turma encontrada"
-        )
+        print("nenhuma turma encontrada")
     return encontrados
 
 
@@ -405,13 +460,9 @@ def _parse_data(s):
         return datetime.now()
 
 
-
-def listar_arquivos_pastas(token, slug, url_rel, profundidade=0):
-    if profundidade > 5:
-        return []
-    base = f"{BASE_SP}/sites/{slug}/_api/web"
+def _buscar_arquivos_pasta(token, base: str, url_rel: str, slug: str) -> list:
     enc = urllib.parse.quote(url_rel, safe="/:@")
-    arquivos = []
+    arqs_locais = []
     try:
         r = get(
             f"{base}/GetFolderByServerRelativeUrl('{enc}')/Files"
@@ -427,7 +478,7 @@ def listar_arquivos_pastas(token, slug, url_rel, profundidade=0):
                 if Path(nome).suffix.lower() not in EXTENSOES:
                     continue
                 url_rel_arq = item.get("ServerRelativeUrl", "")
-                arquivos.append(
+                arqs_locais.append(
                     {
                         "nome": nome,
                         "url": BASE_SP + url_rel_arq,
@@ -442,7 +493,13 @@ def listar_arquivos_pastas(token, slug, url_rel, profundidade=0):
                 )
     except Exception as e:
         if debug:
-            print(f"    [aviso] Pastas: {e}")
+            print(f"    [aviso] Pastas arquivos: {e}")
+    return arqs_locais
+
+
+def _buscar_subpastas(token, base: str, url_rel: str) -> list:
+    enc = urllib.parse.quote(url_rel, safe="/:@")
+    subs_locais = []
     try:
         r = get(
             f"{base}/GetFolderByServerRelativeUrl('{enc}')/Folders"
@@ -458,17 +515,57 @@ def listar_arquivos_pastas(token, slug, url_rel, profundidade=0):
                 if nome_sub.startswith(("_", "Forms")) or nome_sub in PASTAS_ALUNOS:
                     continue
                 if sub.get("ServerRelativeUrl"):
-                    arquivos.extend(
-                        listar_arquivos_pastas(
-                            token, slug, sub["ServerRelativeUrl"], profundidade + 1
-                        )
-                    )
+                    subs_locais.append(sub["ServerRelativeUrl"])
     except Exception:
         pass
+    return subs_locais
+
+
+def _buscar_pasta(token, base: str, slug: str, url_rel: str, prof: int):
+    arqs = _buscar_arquivos_pasta(token, base, url_rel, slug)
+    subs = _buscar_subpastas(token, base, url_rel) if prof < 5 else []
+    return arqs, subs
+
+
+def listar_arquivos_pastas(token, slug, url_rel_raiz, profundidade=0):
+    base = f"{BASE_SP}/sites/{slug}/_api/web"
+    arquivos = []
+    fila = [(url_rel_raiz, 0)]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        while fila:
+            futuros = {
+                pool.submit(_buscar_pasta, token, base, slug, url_rel, prof): prof
+                for url_rel, prof in fila
+            }
+            fila = []
+            for fut in as_completed(futuros):
+                prof_atual = futuros[fut]
+                try:
+                    arqs, subs = fut.result()
+                except Exception:
+                    continue
+                arquivos.extend(arqs)
+                for sub_url in subs:
+                    fila.append((sub_url, prof_atual + 1))
+
     return arquivos
 
 
-def listar_arquivos_turma(token, slug):
+def _listas_padrao(slug: str) -> list:
+    return [
+        {"Title": n, "RootFolder": {"ServerRelativeUrl": f"/sites/{slug}/{n}"}}
+        for n in (
+            "Material de Aula",
+            "Materiais",
+            "Class Files",
+            "Documents",
+            "Documentos",
+        )
+    ]
+
+
+def _buscar_listas_turma(token, slug: str) -> list:
     url = (
         f"{BASE_SP}/sites/{slug}/_api/web/lists"
         f"?$filter=BaseTemplate eq 101 and Hidden eq false"
@@ -480,55 +577,45 @@ def listar_arquivos_turma(token, slug):
         if isinstance(listas, dict):
             listas = listas.get("results", [])
     except Exception:
-        listas = []
+        return _listas_padrao(slug)
+
+    excluidas = LISTAS_SISTEMA | PASTAS_ALUNOS
+    sufixos_excluidos = ("/SiteAssets", "/Style Library", "/FormServerTemplates")
     listas = [
         l
         for l in listas
-        if l.get("Title") not in LISTAS_SISTEMA | PASTAS_ALUNOS
+        if l.get("Title") not in excluidas
         and not l.get("RootFolder", {})
         .get("ServerRelativeUrl", "")
-        .endswith(("/SiteAssets", "/Style Library", "/FormServerTemplates"))
+        .endswith(sufixos_excluidos)
     ]
-    if not listas:
-        listas = [
-            {"Title": n, "RootFolder": {"ServerRelativeUrl": f"/sites/{slug}/{n}"}}
-            for n in (
-                "Material de Aula",
-                "Materiais",
-                "Class Files",
-                "Documents",
-                "Documentos",
-            )
-        ]
+    return listas or _listas_padrao(slug)
+
+
+def listar_arquivos_turma(token, slug):
+    listas = _buscar_listas_turma(token, slug)
     todos, vistos = [], set()
-    for lista in listas:
+
+    def _varrer_lista(lista):
         url_rel = lista.get("RootFolder", {}).get("ServerRelativeUrl", "")
-        for arq in listar_arquivos_pastas(token, slug, url_rel):
-            if arq["id_unico"] not in vistos:
-                vistos.add(arq["id_unico"])
-                todos.append(arq)
+        return listar_arquivos_pastas(token, slug, url_rel)
+
+    with ThreadPoolExecutor(max_workers=min(len(listas), 4)) as pool:
+        for arqs in pool.map(_varrer_lista, listas):
+            for arq in arqs:
+                if arq["id_unico"] not in vistos:
+                    vistos.add(arq["id_unico"])
+                    todos.append(arq)
+
     return todos
 
 
-def _calcular_hash(caminho: Path) -> str:
-    h = hashlib.md5()
-    with open(caminho, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
+CHUNK_SIZE = 128 * 1024
 
 
-def baixar_arquivo(token, arquivo, pasta_destino, numero=0):
-    pasta_destino.mkdir(parents=True, exist_ok=True)
-    nome_salvo = f"{numero:03d}_{arquivo['nome']}" if numero > 0 else arquivo["nome"]
-    caminho = pasta_destino / nome_salvo
-    if caminho.exists():
-        return None, None
-
-    print(f"    baixando: {nome_salvo} ", end="", flush=True)
-
-    url_rel, slug = arquivo.get("url_rel", ""), arquivo.get("slug", "")
+def _montar_urls_download(arquivo: dict, slug: str) -> list:
     urls = []
+    url_rel = arquivo.get("url_rel", "")
     if url_rel and slug:
         enc = urllib.parse.quote(url_rel, safe="/:@")
         urls.append(
@@ -536,30 +623,60 @@ def baixar_arquivo(token, arquivo, pasta_destino, numero=0):
         )
     if arquivo.get("url"):
         urls.append(arquivo["url"])
+    return urls
+
+
+def _gravar_arquivo(caminho, resposta) -> tuple:
+    h = hashlib.md5()
+    total = 0
+    with open(caminho, "wb") as f:
+        for chunk in resposta.iter_content(CHUNK_SIZE):
+            if chunk:
+                f.write(chunk)
+                h.update(chunk)
+                total += len(chunk)
+    return h.hexdigest(), total
+
+
+def _tentar_download(token, url: str, caminho, nome_salvo: str):
+    global _flag_401
+    r = requests.get(url, headers=hdrs(token), timeout=60, stream=True)
+    if r.status_code == 401:
+        _flag_401 = True
+        print(f"    baixando: {nome_salvo} — token expirado")
+        if caminho.exists():
+            caminho.unlink()
+        return None, None
+    if r.status_code == 200:
+        arquivo_hash, total = _gravar_arquivo(caminho, r)
+        print(f"    baixando: {nome_salvo} — ok ({total/1024:.1f} KB)")
+        return caminho, arquivo_hash
+    return False, None
+
+
+def baixar_arquivo(token, arquivo, pasta_destino, numero=0):
+    pasta_destino.mkdir(parents=True, exist_ok=True)
+    nome_salvo = f"{numero:03d}_{arquivo['nome']}" if numero > 0 else arquivo["nome"]
+    caminho = pasta_destino / nome_salvo
+
+    if caminho.exists():
+        return None, None
+
+    slug = arquivo.get("slug", "")
+    urls = _montar_urls_download(arquivo, slug)
 
     for url in urls:
         try:
-            r = requests.get(url, headers=hdrs(token), timeout=60, stream=True)
-            if r.status_code == 401:
-                global _flag_401
-                _flag_401 = True
-                print("token expirado")
-                if caminho.exists():
-                    caminho.unlink()
+            cam, h = _tentar_download(token, url, caminho, nome_salvo)
+            if cam is None and _flag_401:
                 return None, None
-            if r.status_code == 200:
-                with open(caminho, "wb") as f:
-                    total = sum(
-                        len(chunk) for chunk in r.iter_content(8192) if f.write(chunk)
-                    )
-                arquivo_hash = _calcular_hash(caminho)
-                print(f"ok ({total/1024:.1f} KB)")
-                return caminho, arquivo_hash
+            if cam:
+                return cam, h
         except Exception as e:
             if debug:
-                print(f"\n {e}", end="")
+                print(f"    baixando: {nome_salvo} — erro: {e}")
 
-    print("erro")
+    print(f"    baixando: {nome_salvo} — erro")
     if caminho.exists():
         caminho.unlink()
     return None, None
@@ -618,41 +735,44 @@ def telegram_enviar_texto(mensagem: str) -> bool:
         return False
 
 
-def telegram_enviar_documento(caminho: Path, legenda: str = "") -> bool:
-    if not _telegram_configurado():
-        return False
+def _tg_arquivo_grande(caminho, legenda: str) -> bool:
+    print(
+        f" arquivo grande demais para envio direto "
+        f"({caminho.stat().st_size/1024/1024:.1f} MB) enviando só o aviso em texto."
+    )
+    return telegram_enviar_texto(f"{legenda}\n\n(arquivo grande demais para anexar)")
 
-    if not caminho.exists():
-        return False
 
+def _tg_enviar_tentativa(caminho, legenda: str) -> bool | None:
+    with open(caminho, "rb") as f:
+        r = requests.post(
+            f"{_telegram_base_url()}/sendDocument",
+            data={
+                "chat_id": telegram_chat_id,
+                "caption": legenda,
+                "parse_mode": "MarkdownV2",
+            },
+            files={"document": (caminho.name, f)},
+            timeout=180,
+        )
+    if r.status_code == 200:
+        print(f"  [telegram] notificado: {caminho.name}")
+        return True
+    print(f"  [telegram] falha (HTTP {r.status_code}): {r.text[:300]}")
+    return None
+
+
+def telegram_enviar_documento(caminho, legenda: str = "") -> bool:
+    if not _telegram_configurado() or not caminho.exists():
+        return False
     if caminho.stat().st_size > telegram_tamanho_max:
-        print(
-            f" arquivo grande demais para envio direto "
-            f"({caminho.stat().st_size/1024/1024:.1f} MB) enviando só o aviso em texto."
-        )
-        return telegram_enviar_texto(
-            f"{legenda}\n\n(arquivo grande demais para anexar)"
-        )
+        return _tg_arquivo_grande(caminho, legenda)
 
     for tentativa in range(1, 4):
         try:
-            with open(caminho, "rb") as f:
-                r = requests.post(
-                    f"{_telegram_base_url()}/sendDocument",
-                    data={
-                        "chat_id": telegram_chat_id,
-                        "caption": legenda,
-                        "parse_mode": "MarkdownV2",
-                    },
-                    files={"document": (caminho.name, f)},
-                    timeout=180,
-                )
-            if r.status_code == 200:
-                print(f"  [telegram] notificado: {caminho.name}")
+            resultado = _tg_enviar_tentativa(caminho, legenda)
+            if resultado is True:
                 return True
-            print(
-                f"  [telegram] falha (HTTP {r.status_code}), tentativa {tentativa}/3: {r.text[:300]}"
-            )
             telegram_enviar_texto(
                 f"{legenda}\n\n(não foi possivel anexar o arquivo automaticamente)"
             )
@@ -668,7 +788,9 @@ def telegram_enviar_documento(caminho: Path, legenda: str = "") -> bool:
 
 def notificar_arquivo_novo(turma_nome: str, caminho: Path):
     if _telegram_configurado():
-        legenda_tg = f"Novo material em *{_tg_escape(turma_nome)}*\n{_tg_escape(caminho.name)}"
+        legenda_tg = (
+            f"Novo material em *{_tg_escape(turma_nome)}*\n{_tg_escape(caminho.name)}"
+        )
         telegram_enviar_documento(caminho, legenda_tg)
 
     if _whatsapp_configurado():
@@ -676,15 +798,7 @@ def notificar_arquivo_novo(turma_nome: str, caminho: Path):
         whatsapp_enviar_arquivo(caminho, legenda_zap)
 
 
-
-
-def _whatsapp_configurado() -> bool:
-    if not whatsapp_ativo:
-        return False
-    if not whatsapp_numero:
-        if debug:
-            print("WHATSAPP_NUMERO não definido")
-        return False
+def _whatsapp_servidor_pronto() -> bool:
     try:
         r = requests.get(f"{whatsapp_servidor}/status", timeout=3)
         if r.status_code == 200 and r.json().get("pronto"):
@@ -698,6 +812,16 @@ def _whatsapp_configurado() -> bool:
         return False
 
 
+def _whatsapp_configurado() -> bool:
+    if not whatsapp_ativo:
+        return False
+    if not whatsapp_numero:
+        if debug:
+            print("WHATSAPP_NUMERO não definido")
+        return False
+    return _whatsapp_servidor_pronto()
+
+
 def whatsapp_enviar_texto(mensagem: str) -> bool:
     if not _whatsapp_configurado():
         return False
@@ -709,43 +833,51 @@ def whatsapp_enviar_texto(mensagem: str) -> bool:
         )
         if r.status_code == 200:
             return True
-        print(f"  [whatsapp] falha ao enviar texto (HTTP {r.status_code}): {r.text[:200]}")
+        print(
+            f"  [whatsapp] falha ao enviar texto (HTTP {r.status_code}): {r.text[:200]}"
+        )
         return False
     except Exception as e:
         print(f"  [whatsapp] erro de conexão (texto): {e}")
         return False
 
 
-def whatsapp_enviar_arquivo(caminho: Path, legenda: str = "") -> bool:
-    if not _whatsapp_configurado():
-        return False
-    if not caminho.exists():
+def _zap_enviar_tentativa(caminho, legenda: str) -> bool | None:
+    r = requests.post(
+        f"{whatsapp_servidor}/arquivo",
+        json={
+            "numero": whatsapp_numero,
+            "caminho": str(caminho.resolve()),
+            "legenda": legenda,
+        },
+        timeout=120,
+    )
+    if r.status_code == 200:
+        print(f"  [whatsapp] enviado: {caminho.name}")
+        return True
+    print(f"  [whatsapp] falha (HTTP {r.status_code}): {r.text[:200]}")
+    return None
+
+
+def whatsapp_enviar_arquivo(caminho, legenda: str = "") -> bool:
+    if not _whatsapp_configurado() or not caminho.exists():
         return False
 
     for tentativa in range(1, 4):
         try:
-            r = requests.post(
-                f"{whatsapp_servidor}/arquivo",
-                json={
-                    "numero": whatsapp_numero,
-                    "caminho": str(caminho.resolve()),
-                    "legenda": legenda,
-                },
-                timeout=120,
-            )
-            if r.status_code == 200:
-                print(f"  [whatsapp] enviado: {caminho.name}")
+            resultado = _zap_enviar_tentativa(caminho, legenda)
+            if resultado is True:
                 return True
-            print(
-                f"  [whatsapp] falha (HTTP {r.status_code}), tentativa {tentativa}/3: {r.text[:200]}"
-            )
             if tentativa == 1:
-                whatsapp_enviar_texto(f"{legenda}\n\n(não foi possível anexar o arquivo)")
+                whatsapp_enviar_texto(
+                    f"{legenda}\n\n(não foi possível anexar o arquivo)"
+                )
             return False
         except Exception as e:
             print(f"  [whatsapp] erro tentativa {tentativa}/3: {e}")
             if tentativa < 3:
                 time.sleep(5 * tentativa)
+    return False
 
     whatsapp_enviar_texto(f"{legenda}\n\n(falha ao anexar após 3 tentativas)")
     return False
@@ -767,11 +899,77 @@ def verificar_token(token):
     return False
 
 
+def _registrar_duplicata(
+    ctrl, uid: str, arq: dict, slug: str, arquivo_hash: str, caminho
+):
+    caminho.unlink()
+    print(f"    duplicata detectada (hash igual), removendo: {caminho.name}")
+    ctrl[uid] = {
+        "nome": arq["nome"],
+        "turma": slug,
+        "numero": -1,
+        "hash": arquivo_hash,
+        "duplicata": True,
+        "baixado_em": datetime.now().isoformat(),
+    }
+
+
+def _registrar_arquivo(
+    ctrl, uid: str, arq: dict, slug: str, numero: int, arquivo_hash: str
+):
+    ctrl[uid] = {
+        "nome": arq["nome"],
+        "turma": slug,
+        "numero": numero,
+        "hash": arquivo_hash,
+        "baixado_em": datetime.now().isoformat(),
+    }
+
+
+def _baixar_pendentes(token, pendentes: list, slug: str, proximo_base: int) -> dict:
+    resultados: dict = {}
+
+    def _baixar(args):
+        idx, arq = args
+        if _flag_401:
+            return arq["id_unico"], None, None, idx
+        numero = proximo_base + idx
+        cam, h = baixar_arquivo(token, arq, pasta_base / slug, numero=numero)
+        return arq["id_unico"], cam, h, numero
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for uid, cam, h, numero in pool.map(_baixar, pendentes):
+            resultados[uid] = (cam, h, numero)
+    return resultados
+
+
+def _processar_resultados(ctrl, pendentes, resultados, slug, hashes_baixados):
+    fila_notif = []
+    novos = 0
+    for _, arq in pendentes:
+        if _flag_401:
+            break
+        uid = arq["id_unico"]
+        caminho_baixado, arquivo_hash, numero = resultados.get(uid, (None, None, 0))
+        if not caminho_baixado:
+            continue
+        if arquivo_hash and arquivo_hash in hashes_baixados:
+            _registrar_duplicata(ctrl, uid, arq, slug, arquivo_hash, caminho_baixado)
+        else:
+            _registrar_arquivo(ctrl, uid, arq, slug, numero, arquivo_hash)
+            if arquivo_hash:
+                hashes_baixados.add(arquivo_hash)
+            fila_notif.append((arq["nome"], caminho_baixado))
+            novos += 1
+        salvar_controle(ctrl)
+    return fila_notif, novos
+
+
 def executar_ciclo(token, ctrl):
     global _flag_401
     _flag_401 = False
-
     baixados_total = 0
+
     turmas = listar_turmas(token)
     if not turmas:
         return ctrl
@@ -782,9 +980,10 @@ def executar_ciclo(token, ctrl):
 
     for turma in turmas:
         if _flag_401:
-            break  # token expirou no meio
+            break
         slug, nome = turma["slug"], turma["nome"]
         print(f"\n[{nome}]")
+
         arquivos = listar_arquivos_turma(token, slug)
         if not arquivos:
             print("    (nenhum arquivo encontrado)")
@@ -793,50 +992,29 @@ def executar_ciclo(token, ctrl):
         arquivos.sort(key=lambda a: a["modificado"])
         print(f"    {len(arquivos)} arquivo(s) encontrado(s)")
 
-        numeros_usados = [v.get("numero", 0) for v in ctrl.values() if v.get("turma") == slug]
-        proximo = (max(numeros_usados) + 1) if numeros_usados else 1
-        hashes_baixados = {v["hash"] for v in ctrl.values() if v.get("turma") == slug and v.get("hash")}
-        novos = 0
+        numeros_usados = [
+            v.get("numero", 0) for v in ctrl.values() if v.get("turma") == slug
+        ]
+        proximo_base = (max(numeros_usados) + 1) if numeros_usados else 1
+        hashes_baixados = {
+            v["hash"] for v in ctrl.values() if v.get("turma") == slug and v.get("hash")
+        }
 
-        fila_notif = []
-        for arq in arquivos:
-            if _flag_401:
-                break
-            uid = arq["id_unico"]
-            if uid in ctrl:
-                continue
-            caminho_baixado, arquivo_hash = baixar_arquivo(token, arq, pasta_base / slug, numero=proximo)
-            if caminho_baixado:
-                if arquivo_hash and arquivo_hash in hashes_baixados:
-                    print(f"    duplicata detectada (hash igual), removendo: {caminho_baixado.name}")
-                    caminho_baixado.unlink()
-                    ctrl[uid] = {
-                        "nome": arq["nome"],
-                        "turma": slug,
-                        "numero": -1,
-                        "hash": arquivo_hash,
-                        "duplicata": True,
-                        "baixado_em": datetime.now().isoformat(),
-                    }
-                    salvar_controle(ctrl)
-                    continue
-                ctrl[uid] = {
-                    "nome": arq["nome"],
-                    "turma": slug,
-                    "numero": proximo,
-                    "hash": arquivo_hash,
-                    "baixado_em": datetime.now().isoformat(),
-                }
-                if arquivo_hash:
-                    hashes_baixados.add(arquivo_hash)
-                salvar_controle(ctrl)
-                fila_notif.append((nome, caminho_baixado))
-                proximo += 1
-                novos += 1
-                baixados_total += 1
+        pendentes = [
+            (i, arq) for i, arq in enumerate(arquivos) if arq["id_unico"] not in ctrl
+        ]
+        if not pendentes:
+            print("    tudo atualizado.")
+            continue
+
+        resultados = _baixar_pendentes(token, pendentes, slug, proximo_base)
+        fila_notif, novos = _processar_resultados(
+            ctrl, pendentes, resultados, slug, hashes_baixados
+        )
+        baixados_total += novos
 
         for turma_nome, caminho in fila_notif:
-            notificar_arquivo_novo(turma_nome, caminho)
+            notificar_arquivo_novo(nome, caminho)
 
         if novos == 0 and not _flag_401:
             print("    tudo atualizado.")
